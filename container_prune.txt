@@ -1,0 +1,313 @@
+Safe approach: remove stale Podman layers, not live AAP/PostgreSQL data
+If Tenable is detecting
+Copy code
+
+postgresql 15.18
+under Podman overlay storage, but the running AAP 2.6 PostgreSQL service is actually
+Copy code
+
+15.19
+, treat this as a container image/layer hygiene issue first, not a database remediation issue.
+
+Most important: do not manually delete files under:
+
+bash
+Copy code
+
+/var/lib/containers/storage/overlay/
+or, for rootless Podman:
+
+bash
+Copy code
+
+~/.local/share/containers/storage/overlay/
+Manual deletion can corrupt Podman metadata, break AAP containers, or affect database persistence.
+
+1. Confirm what Tenable is detecting
+From the Tenable plugin output, capture the exact path, for example:
+
+text
+Copy code
+
+/var/lib/containers/storage/overlay/<overlay-id>/diff/usr/pgsql-15/...
+Then determine whether that overlay is tied to:
+
+a running AAP container,
+a stopped container,
+an unused old image layer, or
+a mounted volume.
+Run:
+
+bash
+Copy code
+
+sudo podman ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}"
+sudo podman images --digests
+sudo podman system df -v
+Inspect running and stopped containers:
+
+bash
+Copy code
+
+sudo podman inspect \$(sudo podman ps -aq) \
+  --format '{{.Name}} {{.ImageName}} UpperDir={{.GraphDriver.Data.UpperDir}} MergedDir={{.GraphDriver.Data.MergedDir}}'
+If the Tenable path matches an old
+Copy code
+
+UpperDir
+,
+Copy code
+
+MergedDir
+, or unused image layer, it is likely stale container content.
+
+2. Prove the running PostgreSQL version
+Check the actual PostgreSQL server version inside the active AAP PostgreSQL container.
+
+Identify the database container:
+
+bash
+Copy code
+
+sudo podman ps --format "table {{.ID}}\t{{.Names}}\t{{.Image}}" | grep -i postgres
+Then run one or more of the following:
+
+bash
+Copy code
+
+sudo podman exec -it <postgres_container_name_or_id> psql --version
+And if you can connect to the database:
+
+bash
+Copy code
+
+sudo podman exec -it <postgres_container_name_or_id> \
+  psql -U postgres -d postgres -c "SHOW server_version;"
+or:
+
+bash
+Copy code
+
+sudo podman exec -it <postgres_container_name_or_id> \
+  psql -U postgres -d postgres -c "SELECT version();"
+Also check the package inside the running container:
+
+bash
+Copy code
+
+sudo podman exec -it <postgres_container_name_or_id> rpm -qa | grep -i postgresql
+Keep this output as evidence for Tenable closure or exception.
+
+3. Take a backup before cleanup
+Before removing containers or images, take an AAP backup using your approved AAP 2.6 backup procedure.
+
+If your environment uses the AAP installer-based backup workflow, use that. For example, some AAP installations use an installer backup command such as:
+
+bash
+Copy code
+
+./setup.sh -b
+Use the command that matches your deployment method and internal SOP.
+
+Also consider taking a VM or filesystem snapshot if this is a production platform.
+
+4. Remove stopped containers that reference old layers
+List stopped containers:
+
+bash
+Copy code
+
+sudo podman ps -a --filter status=exited
+sudo podman ps -a --filter status=created
+If they are old AAP or PostgreSQL containers no longer required, remove them:
+
+bash
+Copy code
+
+sudo podman rm <container_id>
+You can remove multiple stopped containers only after review:
+
+bash
+Copy code
+
+sudo podman container prune
+This removes stopped containers, not running AAP services.
+
+5. Remove unused old images
+List AAP/PostgreSQL-related images:
+
+bash
+Copy code
+
+sudo podman images --digests | egrep -i 'postgres|ansible|automation|aap|controller|hub|eda'
+Check whether an image is still used:
+
+bash
+Copy code
+
+sudo podman ps -a --format "{{.Image}}" | sort -u
+If an old PostgreSQL 15.18 image is not used by any running or required stopped container, remove it:
+
+bash
+Copy code
+
+sudo podman image rm <image_id>
+Then prune unused images:
+
+bash
+Copy code
+
+sudo podman image prune --all
+You may also use an age filter to reduce risk:
+
+bash
+Copy code
+
+sudo podman image prune --all --filter until=168h
+Avoid this unless you are very sure:
+
+bash
+Copy code
+
+sudo podman system prune --volumes
+Do not remove volumes blindly, because AAP/PostgreSQL data may be stored in Podman volumes or bind mounts.
+
+6. If the 15.18 files are inside the active image layer
+If the Tenable path belongs to a layer used by the current running AAP/PostgreSQL image, do not try to delete the files from the overlay directory.
+
+Instead, the safe options are:
+
+Option A — Update AAP 2.6 to the latest available patch level
+Pull or install the latest supported AAP 2.6 container images from Red Hat, then redeploy using the supported AAP installer or upgrade process.
+
+After upgrade:
+
+bash
+Copy code
+
+sudo podman ps
+sudo podman images --digests
+Then re-check:
+
+bash
+Copy code
+
+sudo podman exec -it <postgres_container> psql --version
+sudo podman exec -it <postgres_container> rpm -qa | grep -i postgresql
+Option B — Raise a Red Hat support case
+If the current Red Hat-provided AAP 2.6 image still contains PostgreSQL 15.18 artifacts in a lower layer while the runtime package is 15.19, raise a support case with:
+
+AAP version
+image name and digest
+Tenable plugin ID and output
+affected overlay path
+Copy code
+
+podman inspect
+output
+Copy code
+
+psql --version
+Copy code
+
+SHOW server_version;
+Copy code
+
+rpm -qa | grep -i postgresql
+Option C — Use a Tenable exception with evidence
+If the running PostgreSQL is confirmed as 15.19 and the 15.18 finding is only from an inactive or non-runtime overlay layer, submit a Tenable false-positive or risk-accepted exception.
+
+Include evidence showing:
+
+bash
+Copy code
+
+SHOW server_version;
+returns:
+
+text
+Copy code
+
+15.19
+and that the vulnerable 15.18 path is not part of the running container filesystem.
+
+7. Re-scan after cleanup
+After removing unused containers and images:
+
+bash
+Copy code
+
+sudo podman system df -v
+Then ask Tenable to re-scan the host.
+
+If the finding disappears, it was stale Podman content.
+
+If the finding remains, map the new detected path again and confirm whether it is still in active image storage.
+
+Recommended Tenable handling
+For container hosts, Tenable can flag packages inside Podman overlay layers even when those layers are not active runtime software. The safer scanning model is:
+
+scan the host OS normally,
+scan container images through an image/container-aware process, and
+avoid treating stale overlay files as equivalent to running packages unless they are used by an active container.
+If your security team agrees, configure a targeted exception for the specific plugin/path rather than broadly excluding all of
+Copy code
+
+/var/lib/containers/storage/overlay
+.
+
+Practical remediation flow
+Use this sequence:
+
+bash
+Copy code
+
+# 1. Confirm running DB version
+sudo podman exec -it <postgres_container> psql --version
+sudo podman exec -it <postgres_container> psql -U postgres -d postgres -c "SHOW server_version;"
+
+# 2. Review containers/images
+sudo podman ps -a
+sudo podman images --digests
+sudo podman system df -v
+
+# 3. Backup AAP
+# Use your approved AAP 2.6 backup command/SOP
+
+# 4. Remove stopped old containers
+sudo podman container prune
+
+# 5. Remove unused images
+sudo podman image prune --all
+
+# 6. Re-check storage
+sudo podman system df -v
+
+# 7. Re-scan with Tenable
+Key takeaway
+If PostgreSQL 15.19 is the actual running version, do not manually remove PostgreSQL 15.18 files from Podman overlay storage. Safely remove only unused containers and images through Podman commands. If 15.18 remains in an active vendor image layer, remediate through an official AAP image update or document it as a Tenable false positive with runtime evidence.
+
+References:
+
+Red Hat Ansible Automation Platform 2.6 documentation: [https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.6]
+Podman
+Copy code
+
+image prune
+: [https://docs.podman.io/en/latest/markdown/podman-image-prune.1.html]
+Podman
+Copy code
+
+container prune
+: [https://docs.podman.io/en/latest/markdown/podman-container-prune.1.html]
+Podman
+Copy code
+
+system df
+: [https://docs.podman.io/en/latest/markdown/podman-system-df.1.html]
+Podman
+Copy code
+
+inspect
+: [https://docs.podman.io/en/latest/markdown/podman-inspect.1.html]
+PostgreSQL version information: [https://www.postgresql.org/docs/current/runtime-config-preset.html]
